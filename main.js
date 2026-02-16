@@ -32,12 +32,43 @@ const lastUpdatedEl = document.getElementById('last-updated');
 // --- HELPER: DELAY FUNCTION ---
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+// --- PROXY STRATEGY ---
+// We rotate between these proxies to avoid hitting rate limits on a single one
+async function fetchWithProxy(targetUrl) {
+    const proxies = [
+        // 1. AllOrigins (Returns JSON wrapper)
+        { url: `https://api.allorigins.win/get?url=${encodeURIComponent(targetUrl)}`, type: 'wrapper' },
+        // 2. CorsProxy.io (Direct)
+        { url: `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`, type: 'direct' },
+        // 3. ThingProxy (Direct)
+        { url: `https://thingproxy.freeboard.io/fetch/${targetUrl}`, type: 'direct' }
+    ];
+
+    for (const proxy of proxies) {
+        try {
+            const response = await fetch(proxy.url);
+            if (!response.ok) throw new Error(`Status ${response.status}`);
+            
+            if (proxy.type === 'wrapper') {
+                const data = await response.json();
+                return data.contents;
+            } else {
+                return await response.text();
+            }
+        } catch (e) {
+            console.warn(`Proxy failed: ${proxy.url}. Trying next...`);
+            // Wait 1 second before switching to the backup proxy
+            await delay(1000); 
+        }
+    }
+    throw new Error("All proxies failed");
+}
+
 // --- INITIALIZATION ---
 function init() {
     renderCards();
     fetchSequentially();
-    
-    // Auto-refresh every 5 minutes (300000ms) to avoid hitting limits
+    // Refresh every 5 minutes
     setInterval(fetchSequentially, 300000); 
 }
 
@@ -46,7 +77,6 @@ function renderCards() {
     services.forEach(service => {
         const card = document.createElement('div');
         card.className = 'card';
-        // Sanitize ID
         const safeId = service.name.replace(/[^a-zA-Z0-9]/g, '-');
         card.id = `card-${safeId}`;
         
@@ -69,10 +99,9 @@ async function fetchSequentially() {
     updateTime();
     
     for (const service of services) {
-        // Fetch one, then wait, then fetch next
         await checkService(service);
-        // Wait 800ms between requests to prevent 429 Errors
-        await delay(800); 
+        // 2 Second delay between requests to be very gentle
+        await delay(2000); 
     }
 }
 
@@ -80,28 +109,12 @@ async function checkService(service) {
     const safeId = service.name.replace(/[^a-zA-Z0-9]/g, '-');
     const el = document.getElementById(`status-${safeId}`);
     
-    // Update UI to show we are currently checking this one
+    // Update UI
     el.querySelector('.status-text').textContent = "CHECKING...";
 
-    // PRIMARY PROXY (AllOrigins)
-    let proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(service.apiUrl)}`;
-    
     try {
-        let rawBody = null;
-
-        try {
-            const response = await fetch(proxyUrl);
-            if (!response.ok) throw new Error("Proxy Error");
-            const data = await response.json();
-            rawBody = data.contents;
-        } catch (err) {
-            console.warn(`Primary proxy failed for ${service.name}, trying backup...`);
-            // BACKUP PROXY (CorsProxy.io)
-            const backupUrl = `https://corsproxy.io/?${encodeURIComponent(service.apiUrl)}`;
-            const backupResp = await fetch(backupUrl);
-            if (!backupResp.ok) throw new Error("Backup Proxy Error");
-            rawBody = await backupResp.text();
-        }
+        // Use the Rotation Function here
+        const rawBody = await fetchWithProxy(service.apiUrl);
 
         if(!rawBody) throw new Error("Empty response");
 
