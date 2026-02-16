@@ -1,26 +1,11 @@
 // --- CONFIGURATION ---
 const services = [
     // --- THE BIG 3 (XML/RSS) ---
-    { 
-        name: "AWS Global", 
-        apiUrl: "https://status.aws.amazon.com/rss/all.rss", 
-        pageUrl: "https://health.aws.amazon.com/health/status",
-        type: "rss_aws" 
-    },
-    { 
-        name: "Google Cloud", 
-        apiUrl: "https://status.cloud.google.com/en/feed.atom", 
-        pageUrl: "https://status.cloud.google.com/",
-        type: "rss_gcp" 
-    },
-    { 
-        name: "Microsoft Azure", 
-        apiUrl: "https://azure.status.microsoft.com/en-us/status/feed/", 
-        pageUrl: "https://azure.status.microsoft.com/",
-        type: "rss_azure" 
-    },
+    { name: "AWS Global", apiUrl: "https://status.aws.amazon.com/rss/all.rss", pageUrl: "https://health.aws.amazon.com/health/status", type: "rss_aws" },
+    { name: "Google Cloud", apiUrl: "https://status.cloud.google.com/en/feed.atom", pageUrl: "https://status.cloud.google.com/", type: "rss_gcp" },
+    { name: "Microsoft Azure", apiUrl: "https://azure.status.microsoft.com/en-us/status/feed/", pageUrl: "https://azure.status.microsoft.com/", type: "rss_azure" },
 
-    // --- INFRASTRUCTURE (Standard JSON) ---
+    // --- INFRASTRUCTURE ---
     { name: "GitHub", apiUrl: "https://www.githubstatus.com/api/v2/status.json", pageUrl: "https://www.githubstatus.com/", type: "std" },
     { name: "DigitalOcean", apiUrl: "https://status.digitalocean.com/api/v2/status.json", pageUrl: "https://status.digitalocean.com/", type: "std" },
     { name: "Cloudflare", apiUrl: "https://www.cloudflarestatus.com/api/v2/status.json", pageUrl: "https://www.cloudflarestatus.com/", type: "std" },
@@ -35,7 +20,7 @@ const services = [
     { name: "Zoom", apiUrl: "https://status.zoom.us/api/v2/status.json", pageUrl: "https://status.zoom.us/", type: "std" },
     { name: "OpenAI API", apiUrl: "https://status.openai.com/api/v2/status.json", pageUrl: "https://status.openai.com/", type: "std" },
 
-    // --- SAAS & PAYMENTS ---
+    // --- SAAS ---
     { name: "Stripe", apiUrl: "https://status.stripe.com/api/v2/status.json", pageUrl: "https://status.stripe.com/", type: "std" },
     { name: "Shopify", apiUrl: "https://www.shopifystatus.com/api/v2/status.json", pageUrl: "https://www.shopifystatus.com/", type: "std" },
     { name: "Zendesk", apiUrl: "https://status.zendesk.com/api/incidents/active", pageUrl: "https://status.zendesk.com/", type: "zendesk" },
@@ -44,73 +29,90 @@ const services = [
 const dashboard = document.getElementById('dashboard');
 const lastUpdatedEl = document.getElementById('last-updated');
 
+// --- HELPER: DELAY FUNCTION ---
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 // --- INITIALIZATION ---
 function init() {
     renderCards();
-    fetchAllStatuses();
+    fetchSequentially();
     
-    // Auto-refresh every 60 seconds
-    setInterval(fetchAllStatuses, 60000);
+    // Auto-refresh every 5 minutes (300000ms) to avoid hitting limits
+    setInterval(fetchSequentially, 300000); 
 }
 
-// 1. Render the HTML Cards (Initial State)
 function renderCards() {
     dashboard.innerHTML = '';
     services.forEach(service => {
         const card = document.createElement('div');
         card.className = 'card';
-        card.id = `card-${service.name.replace(/\s+/g, '-')}`;
+        // Sanitize ID
+        const safeId = service.name.replace(/[^a-zA-Z0-9]/g, '-');
+        card.id = `card-${safeId}`;
         
         card.innerHTML = `
             <div class="card-header">
                 <div class="service-name">${service.name}</div>
-                <a href="${service.pageUrl}" target="_blank" class="service-link" title="Visit Status Page">
-                    Visit Page ↗
-                </a>
+                <a href="${service.pageUrl}" target="_blank" class="service-link">Page ↗</a>
             </div>
-            <div class="status-container loading" id="status-${service.name.replace(/\s+/g, '-')}">
+            <div class="status-container loading" id="status-${safeId}">
                 <div class="status-dot"></div>
-                <div class="status-text">LOADING...</div>
+                <div class="status-text">WAITING...</div>
             </div>
         `;
         dashboard.appendChild(card);
     });
 }
 
-// 2. Fetch Logic
-async function fetchAllStatuses() {
+// --- SEQUENTIAL FETCHING ---
+async function fetchSequentially() {
     updateTime();
     
-    // We process these in parallel
-    const promises = services.map(service => checkService(service));
-    await Promise.all(promises);
+    for (const service of services) {
+        // Fetch one, then wait, then fetch next
+        await checkService(service);
+        // Wait 800ms between requests to prevent 429 Errors
+        await delay(800); 
+    }
 }
 
 async function checkService(service) {
-    const elementId = `status-${service.name.replace(/\s+/g, '-')}`;
-    const el = document.getElementById(elementId);
+    const safeId = service.name.replace(/[^a-zA-Z0-9]/g, '-');
+    const el = document.getElementById(`status-${safeId}`);
     
-    // Using AllOrigins to bypass CORS
-    const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(service.apiUrl)}`;
+    // Update UI to show we are currently checking this one
+    el.querySelector('.status-text').textContent = "CHECKING...";
 
+    // PRIMARY PROXY (AllOrigins)
+    let proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(service.apiUrl)}`;
+    
     try {
-        const response = await fetch(proxyUrl);
-        const data = await response.json();
-        
-        // 'contents' is the string body from the proxy
-        const rawBody = data.contents;
+        let rawBody = null;
+
+        try {
+            const response = await fetch(proxyUrl);
+            if (!response.ok) throw new Error("Proxy Error");
+            const data = await response.json();
+            rawBody = data.contents;
+        } catch (err) {
+            console.warn(`Primary proxy failed for ${service.name}, trying backup...`);
+            // BACKUP PROXY (CorsProxy.io)
+            const backupUrl = `https://corsproxy.io/?${encodeURIComponent(service.apiUrl)}`;
+            const backupResp = await fetch(backupUrl);
+            if (!backupResp.ok) throw new Error("Backup Proxy Error");
+            rawBody = await backupResp.text();
+        }
+
         if(!rawBody) throw new Error("Empty response");
 
+        // --- PARSING LOGIC ---
         let status = "UNKNOWN";
-        let state = "loading"; // 'up', 'warn', 'down'
-
-        // --- PARSERS ---
+        let state = "loading";
 
         if (service.type === 'std') {
-            // Atlassian Statuspage Standard
             const json = JSON.parse(rawBody);
-            const indicator = json.status.indicator; // none, minor, major, critical
-            if (indicator === 'none') { state = 'up'; status = 'OPERATIONAL'; }
+            const indicator = json.status.indicator || json.status.description; 
+            if (indicator === 'none' || indicator === 'All Systems Operational') { state = 'up'; status = 'OPERATIONAL'; }
             else if (indicator === 'minor') { state = 'warn'; status = 'DEGRADED'; }
             else { state = 'down'; status = 'OUTAGE'; }
         }
@@ -121,37 +123,30 @@ async function checkService(service) {
         }
         else if (service.type === 'heroku') {
             const json = JSON.parse(rawBody);
-            // Check production status
             const prod = json.status.find(s => s.system === 'Apps');
             if (prod && prod.status === 'green') { state = 'up'; status = 'OPERATIONAL'; }
             else { state = 'warn'; status = 'ISSUES'; }
         }
         else if (service.type === 'zendesk') {
             const json = JSON.parse(rawBody);
-            // If incidents list is empty, all good
             if (json.incidents && json.incidents.length === 0) { state = 'up'; status = 'OPERATIONAL'; }
             else { state = 'warn'; status = 'INCIDENTS'; }
         }
         else if (service.type.startsWith('rss')) {
-            // XML Parsing for Big 3
             const parser = new DOMParser();
             const xml = parser.parseFromString(rawBody, "text/xml");
             
             if (service.type === 'rss_aws') {
                 const items = xml.querySelectorAll('item');
-                // AWS RSS only contains ACTIVE incidents.
                 if (items.length === 0) { state = 'up'; status = 'OPERATIONAL'; }
                 else { 
-                    // Check if item is recent (last 24h)
                     const pubDate = new Date(items[0].querySelector('pubDate').textContent);
                     if ((new Date() - pubDate) < 86400000) { state = 'warn'; status = 'ISSUES'; }
-                    else { state = 'up'; status = 'OPERATIONAL'; } // Old incident in feed
+                    else { state = 'up'; status = 'OPERATIONAL'; }
                 }
             }
             else if (service.type === 'rss_gcp') {
-                // Google Atom feed
                 const entries = xml.querySelectorAll('entry');
-                // Usually lists recent incidents. We assume OK unless we see a very recent entry.
                 if (entries.length === 0) { state = 'up'; status = 'OPERATIONAL'; }
                 else {
                     const updated = new Date(entries[0].querySelector('updated').textContent);
@@ -160,7 +155,6 @@ async function checkService(service) {
                 }
             }
             else if (service.type === 'rss_azure') {
-                // Azure is chatty. We scan titles for keywords.
                 const items = xml.querySelectorAll('item');
                 let foundIssue = false;
                 items.forEach(item => {
@@ -174,7 +168,6 @@ async function checkService(service) {
             }
         }
 
-        // Update UI
         updateCard(el, state, status);
 
     } catch (e) {
@@ -184,11 +177,8 @@ async function checkService(service) {
 }
 
 function updateCard(el, state, text) {
-    // Reset classes
     el.className = 'status-container'; 
     el.classList.add(state);
-    
-    // Update text
     el.querySelector('.status-text').textContent = text;
 }
 
@@ -197,5 +187,4 @@ function updateTime() {
     lastUpdatedEl.textContent = `Last check: ${now.toLocaleTimeString()}`;
 }
 
-// Start
 init();
